@@ -186,7 +186,10 @@ object StorehausBuild extends Build {
   ).dependsOn(storehausAlgebra % "test->test;compile->compile")
 
   lazy val storehausMySQL = module("mysql").settings(
-    libraryDependencies += Finagle.module("mysql")
+    libraryDependencies ++= Seq(
+      "org.mockito" % "mockito-all" % "1.9.0" % "test",
+      Finagle.module("mysql")
+    )
   ).dependsOn(storehausAlgebra % "test->test;compile->compile")
 
   lazy val storehausRedis = module("redis").settings(

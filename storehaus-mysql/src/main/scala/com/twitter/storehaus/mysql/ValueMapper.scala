@@ -119,6 +119,17 @@ class MySqlValue(val v: Value) {
   }
 }
 
+class ColumnMySqlValue(val v: List[MySqlValue]) {
+  override def equals(o: Any) = o match {
+    // Relies on equals defined above
+    case o: ColumnMySqlValue => o.v == this.v
+    case _ => false
+  }
+  override def hashCode: Int = {
+    this.v.hashCode
+  }
+}
+
 /**
  * Injection from MySqlValue to String.
  * Returns string representation of the finagle-mysql Value wrapped by MySqlValue
@@ -127,6 +138,16 @@ class MySqlValue(val v: Value) {
 object MySqlStringInjection extends Injection[MySqlValue, String] {
   def apply(a: MySqlValue): String = ValueMapper.toString(a.v).getOrElse("") // should this be null: String instead?
   override def invert(b: String) = Try(MySqlValue(RawValue(Type.String, Charset.Utf8_general_ci, false, b.getBytes)))
+}
+
+object ColumnMySqlStringInjection extends Injection[ColumnMySqlValue, List[String]] {
+  override def apply(a: ColumnMySqlValue): List[String] = {
+    a.v.map(MySqlStringInjection(_))
+  }
+
+  override def invert(b: List[String]): Try[ColumnMySqlValue] = {
+    Try(new ColumnMySqlValue(b.map(MySqlStringInjection.invert(_).get).toList))
+  }
 }
 
 /**
