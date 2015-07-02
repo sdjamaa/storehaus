@@ -16,14 +16,16 @@ class ColumnMySQLStore(client: Client, table: String, kCols: List[String], vCols
     }.mkString(" AND ")
 
   protected[mysql] val MULTI_SELECT_SQL_PREFIX =
-    "SELECT " + flatten(kCols) + ", " + flatten(vCols) +
+    "SELECT " + flatten(kCols) + "," + flatten(vCols) +
       " FROM " + g(table) +
       " WHERE " + "(" + flatten(kCols) + ")" +
       " IN "
 
   protected[mysql] val UPDATE_SQL =
     "UPDATE " + g(table) +
-    " SET " + vCols.map { g(_) + " =?" }.mkString(",") +
+      " SET " + vCols.map {
+      g(_) + " =?"
+    }.mkString(",") +
       " WHERE " + kCols.map {
       g(_) + " =?"
     }.mkString(" AND ")
@@ -33,10 +35,10 @@ class ColumnMySQLStore(client: Client, table: String, kCols: List[String], vCols
 
   protected[mysql] val INSERT_SQL =
     "INSERT INTO " + g(table) + " (" + flatten(kCols) + "," + flatten(vCols) + ")" +
-    " VALUES " + Stream.continually("?").take(kCols.length + vCols.length).mkString("(", ",", ")")
+      " VALUES " + Stream.continually("?").take(kCols.length + vCols.length).mkString("(", ",", ")")
 
   protected[mysql] val MULTI_INSERT_SQL_PREFIX =
-    "INSERT INTO " + g(table) + "(" + flatten(kCols) + "," + flatten(vCols) + ") VALUES "
+    "INSERT INTO " + g(table) + " (" + flatten(kCols) + "," + flatten(vCols) + ") VALUES "
 
   private def flatten(cols: List[String]) = {
     cols.map {
@@ -59,7 +61,10 @@ class ColumnMySQLStore(client: Client, table: String, kCols: List[String], vCols
   protected val COMMIT_TXN_SQL = "COMMIT"
   protected val ROLLBACK_TXN_SQL = "ROLLBACK"
 
-  protected[mysql] def startTransaction: Future[Unit] = client.query(START_TXN_SQL).unit
+  protected[mysql] def startTransaction: Future[Unit] = {
+    val res = client.query(START_TXN_SQL)
+    res.unit
+  }
 
   protected[mysql] def commitTransaction: Future[Unit] = client.query(COMMIT_TXN_SQL).unit
 
@@ -89,21 +94,33 @@ class ColumnMySQLStore(client: Client, table: String, kCols: List[String], vCols
   override def multiGet[K1 <: ColumnMySqlValue](ks: Set[K1]): Map[K1, Future[Option[ColumnMySqlValue]]] = {
     if (ks.isEmpty) return Map()
 
-    val placeholders = Stream.continually("?").take(ks.size).mkString("(", ",", ")")
-    val params = Stream.continually(placeholders).take(kCols.size).mkString("(", ",", ")")
+    val placeholders = Stream.continually("?").take(kCols.size).mkString("(", ",", ")")
+    val params = Stream.continually(placeholders).take(ks.size).mkString("(", ",", ")")
     val selectSql = MULTI_SELECT_SQL_PREFIX + params
 
+    val selectParams = serializeMySqlValue(ks)
+
     val mysqlResult: Future[(PreparedStatement, Seq[(ColumnMySqlValue, ColumnMySqlValue)])] =
-      client.prepareAndSelect(selectSql, ks.flatMap(key => ColumnMySqlStringInjection(key).map(_.getBytes)).toSeq: _*) { row =>
-        (new ColumnMySqlValue(kCols.map { kCol => row(kCol).map(MySqlValue(_)) match { case Some(v) => MySqlValue(v) } }),
-         new ColumnMySqlValue(kCols.map { vCol => row(vCol).map(MySqlValue(_)) match { case Some(v) => MySqlValue(v) } }))
+      client.prepareAndSelect(selectSql, selectParams: _*) { row => (
+        new ColumnMySqlValue(kCols.map { kCol => row(kCol).map(MySqlValue(_)) match {
+          case Some(v) => v
+        }}),
+        new ColumnMySqlValue(kCols.map { vCol => row(vCol).map(MySqlValue(_)) match {
+          case Some(v) => v
+        }}))
       }
     FutureOps.liftValues(ks,
     mysqlResult.map { case (ps, rows) =>
       client.closeStatement(ps)
-      rows.toMap.filterKeys { _ != None }.map { case (optK, optV) => (optK, Some(optV)) }
+      rows.toMap.filterKeys {
+        _ != None
+      }.map { case (optK, optV) => (optK, Some(optV))}
     }, { (k: K1) => Future.None}
     )
+  }
+
+  protected[mysql] def serializeMySqlValue[K1 <: ColumnMySqlValue](ks: Set[K1]): Array[Array[Byte]] = {
+    ks.flatMap(key => ColumnMySqlStringInjection(key).map(_.getBytes)).toArray
   }
 
   override def put(kv: (ColumnMySqlValue, Option[ColumnMySqlValue])): Future[Unit] = {
@@ -126,9 +143,10 @@ class ColumnMySQLStore(client: Client, table: String, kCols: List[String], vCols
         case Some(value) =>
           updateStmt.parameters = (ColumnMySqlStringInjection(k).map { _.getBytes } ++
             ColumnMySqlStringInjection(v).map { _.getBytes }).toArray
+
           client.execute(updateStmt)
         case None =>
-          insertStmt.parameters = (ColumnMySqlStringInjection(k).map { _.getBytes } ++
+          insertStmt.parameters = (ColumnMySqlStringInjection(k).map { _.getBytes} ++
             ColumnMySqlStringInjection(v).map { _.getBytes }).toArray
 
           client.execute(insertStmt)
@@ -136,43 +154,58 @@ class ColumnMySQLStore(client: Client, table: String, kCols: List[String], vCols
     }
   }
 
-  protected def executeMultiInsert[K1 <: ColumnMySqlValue](kvs: Map[K1, ColumnMySqlValue]) = {
+  protected[mysql] def executeMultiInsert[K1 <: ColumnMySqlValue](kvs: Map[K1, ColumnMySqlValue]) = {
     val placeholders = Stream.continually("?").take(kCols.length + vCols.length).mkString("(", ",", ")")
-    val params = Stream.continually(placeholders).take(kvs.size).mkString("(", ",", ")")
+    val params = Stream.continually(placeholders).take(kvs.size).mkString(",")
 
     val insertSql = MULTI_INSERT_SQL_PREFIX + params
-    val insertParams = kvs.flatMap { kv =>
-      ColumnMySqlStringInjection(kv._1).map { _.getBytes } ++ ColumnMySqlStringInjection(kv._2).map { _.getBytes }
-    }.toSeq
-    client.prepareAndExecute(insertSql, insertParams:_*).map { case (ps, r) =>
+    val insertParams = serializeValues(kvs).toSeq
+    client.prepareAndExecute(insertSql, insertParams: _*).map { case (ps, r) =>
       // close prepared statement on server
       client.closeStatement(ps)
     }
   }
 
-  protected def executeMultiUpdate[K1 <: ColumnMySqlValue](kvs: Map[K1, ColumnMySqlValue]) = {
+  def serializeValues[K1 <: ColumnMySqlValue](kvs: Map[K1, ColumnMySqlValue]): Iterable[Array[Byte]] = {
+    kvs.flatMap { kv =>
+      ColumnMySqlStringInjection(kv._1).map { _.getBytes } ++ ColumnMySqlStringInjection(kv._2).map { _.getBytes }
+    }
+  }
 
-    val whenClause = kCols.map { kCol => kCol + " = ? " }.mkString("WHEN ", " AND ", " THEN ? ") * kvs.size
-    val setClause = vCols.map { vCol => " SET " + vCol + " = CASE " + whenClause + "END " }.mkString(",")
+  protected[mysql] def executeMultiUpdate[K1 <: ColumnMySqlValue](kvs: Map[K1, ColumnMySqlValue]) = {
+
+    val whenClause = kCols.map { kCol => g(kCol) + " =?"}.mkString("WHEN ", " AND ", " THEN ? ") * kvs.size
+    val setClause = vCols.map { vCol => " SET " + g(vCol) + " = CASE " + whenClause + "END"}.mkString(",")
 
     val placeholders = Stream.continually("?").take(kCols.size).mkString("(", ",", ")")
     val params = Stream.continually(placeholders).take(kvs.size).mkString("(", ",", ")")
 
     val updateSql = MULTI_UPDATE_SQL_PREFIX + setClause + MULTI_UPDATE_SQL_INFIX + params
 
-    val injectedKeys = kvs.keys.toSeq.flatMap { ColumnMySqlStringInjection(_).map { _.getBytes } }
-    val injectedValues = kvs.values.toSeq.map { ColumnMySqlStringInjection(_).map { _.getBytes } }
+    val updateParams = serializeKeyAndValueForUpdate(kvs)
 
-    val multiUpdateCaseParams = for (i <- 0 until vCols.size;
-                                 j <- 0 to kvs.size) yield
-      injectedKeys(j) ++ injectedValues(j)(i)
-
-    val updateInParams = kvs.flatMap { kv => ColumnMySqlStringInjection(kv._1).map { _.getBytes } }.toSeq
-
-    client.prepareAndExecute(updateSql, (multiUpdateCaseParams ++ updateInParams):_*).map { case (ps, r) =>
+    client.prepareAndExecute(updateSql, updateParams: _*).map { case (ps, r) =>
       // close prepared statement on server
       client.closeStatement(ps)
     }
+  }
+
+  def serializeKeyAndValueForUpdate[K1 <: ColumnMySqlValue](kvs: Map[K1, ColumnMySqlValue]) = {
+    val injectedKeys = kvs.keys.map {
+      ColumnMySqlStringInjection(_).map { _.getBytes }
+    }.toList
+
+    val injectedValues = kvs.values.toSeq.map {
+      ColumnMySqlStringInjection(_).map { _.getBytes }
+    }.transpose.toList
+
+    val multiUpdateCaseParams = injectedValues.flatMap { v =>
+      for (i <- 0 until kvs.size) yield (injectedKeys(i) :+ v(i))
+    }.flatten.toList
+
+    val updateInParams = kvs.flatMap { kv => ColumnMySqlStringInjection(kv._1).map { _.getBytes } }.toSeq
+
+    multiUpdateCaseParams ++ updateInParams
   }
 
   override def multiPut[K1 <: ColumnMySqlValue](kvs: Map[K1, Option[ColumnMySqlValue]]): Map[K1, Future[Unit]] = {
@@ -181,16 +214,22 @@ class ColumnMySQLStore(client: Client, table: String, kCols: List[String], vCols
     // http://dev.mysql.com/doc/refman/5.1/en/packet-too-large.html
     val putResult = startTransaction.flatMap { t =>
       FutureOps.mapCollect(multiGet(kvs.keySet)).flatMap { result =>
-        val existingKeys = result.filter { !_._2.isEmpty }.keySet
-        val newKeys = result.filter { _._2.isEmpty }.keySet
+        val existingKeys = result.filter {
+          !_._2.isEmpty
+        }.keySet
+        val newKeys = result.filter {
+          _._2.isEmpty
+        }.keySet
 
         // handle inserts for new keys
         val insertF = newKeys.isEmpty match {
           case true => Future.Unit
           case false =>
             // do not include None values in insert query
-            val insertKvs = newKeys.map { k => k -> kvs.getOrElse(k, None) }.filter { ! _._2.isEmpty }
-              .toMap.mapValues { v => v.get }
+            val insertKvs = newKeys.map { k => k -> kvs.getOrElse(k, None)}.filter {
+              !_._2.isEmpty
+            }
+              .toMap.mapValues { v => v.get}
             insertKvs.isEmpty match {
               case true => Future.Unit
               case false => executeMultiInsert(insertKvs)
@@ -198,24 +237,34 @@ class ColumnMySQLStore(client: Client, table: String, kCols: List[String], vCols
         }
 
         // handle update and/or delete for existing keys
-        val existingKvs = existingKeys.map { k => k -> kvs.getOrElse(k, None) }
+        val existingKvs = existingKeys.map { k => k -> kvs.getOrElse(k, None)}
 
         // do not include None values in update query
-        val updateKvs = existingKvs.filter { ! _._2.isEmpty }
-          .toMap.mapValues { v => v.get }
+        val updateKvs = existingKvs.filter {
+          !_._2.isEmpty
+        }
+          .toMap.mapValues { v => v.get}
         lazy val updateF = updateKvs.isEmpty match {
           case true => Future.Unit
           case false => executeMultiUpdate(updateKvs)
         }
 
         // deletes
-        val deleteKeys = existingKvs.filter { _._2.isEmpty }.map { _._1 }
+        val deleteKeys = existingKvs.filter {
+          _._2.isEmpty
+        }.map {
+          _._1
+        }
         lazy val deleteF = deleteKeys.isEmpty match {
           case true => Future.Unit
           case false =>
-            val deleteSql = MULTI_DELETE_SQL_PREFIX + Stream.continually("?").take(deleteKeys.size).mkString("(", ",", ")")
-            val deleteParams = deleteKeys.flatMap { k => ColumnMySqlStringInjection(k).map {_ .getBytes } }.toSeq
-            client.prepareAndExecute(deleteSql, deleteParams:_*).map { case (ps, r) =>
+            val deleteSql = {
+              val placeholders = Stream.continually("?").take(kCols.size).mkString("(", ",", ")")
+              val paramHolders = Stream.continually(placeholders).take(deleteKeys.size).mkString("(", ",", ")")
+              MULTI_DELETE_SQL_PREFIX + paramHolders
+            }
+            val deleteParams = serializeKeys(deleteKeys).toSeq
+            client.prepareAndExecute(deleteSql, deleteParams: _*).map { case (ps, r) =>
               // close prepared statement on server
               client.closeStatement(ps)
             }
@@ -224,15 +273,25 @@ class ColumnMySQLStore(client: Client, table: String, kCols: List[String], vCols
         // sequence the three queries. the inner futures are lazy
         insertF.flatMap { f =>
           updateF.flatMap { f =>
-            deleteF.flatMap { f => commitTransaction }
-              .handle { case e: Exception => rollbackTransaction.flatMap { throw e } }
+            deleteF.flatMap { f => commitTransaction}
+              .handle { case e: Exception => rollbackTransaction.flatMap {
+              throw e
+            }
+            }
           }
         }
       }
     }
-    kvs.mapValues { v => putResult.unit }
+    kvs.mapValues { v => putResult.unit}
   }
 
+
+  def serializeKeys[K1 <: ColumnMySqlValue](deleteKeys: Set[K1]): Set[Array[Byte]] = {
+    deleteKeys.flatMap { k => ColumnMySqlStringInjection(k).map {
+      _.getBytes
+    }
+    }
+  }
 
   override def close(t: Time) = {
     // close prepared statements before closing the connection
@@ -245,4 +304,10 @@ class ColumnMySQLStore(client: Client, table: String, kCols: List[String], vCols
 
   // enclose table or column names in backticks, in case they happen to be sql keywords
   protected def g(s: String) = "`" + s + "`"
+}
+
+object ColumnMySQLStore {
+  def apply(client: Client, table: String, kCols: List[String], vCols: List[String]) = {
+    new ColumnMySQLStore(client, table, kCols, vCols)
+  }
 }

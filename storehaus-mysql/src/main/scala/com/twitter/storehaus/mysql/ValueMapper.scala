@@ -142,7 +142,7 @@ object MySqlStringInjection extends Injection[MySqlValue, String] {
 
 object ColumnMySqlStringInjection extends Injection[ColumnMySqlValue, List[String]] {
   override def apply(a: ColumnMySqlValue): List[String] = {
-    a.v.map(MySqlStringInjection(_))
+    a.v.map(MySqlStringInjection(_)).toList
   }
 
   override def invert(b: List[String]): Try[ColumnMySqlValue] = {
